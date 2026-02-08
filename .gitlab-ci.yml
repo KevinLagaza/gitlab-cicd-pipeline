@@ -6,7 +6,8 @@ variables:
   STORAGE: 100
   APP_CONTAINER_PORT: "5000"
   IMAGE_NAME: $CI_REGISTRY_IMAGE
-  IMAGE_TAG: $CI_COMMIT_REF_SLUG
+  DEFAULT_IMAGE_TAG: $CI_COMMIT_REF_SLUG
+  IMAGE_TAG: "v1.0.0"
   SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
   GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
 
@@ -24,13 +25,13 @@ services:
   script:
     - apk --no-cache add curl
     - echo "Testing URL http://${DOMAIN}:5000"
-    # Test 1: Check if host is reachable
+    # Check if host is reachable
     - echo "Step 1// Checking host connectivity..."
     - ping -c 2 ${DOMAIN} || echo "Ping failed (might be blocked)"
-    # Test 2: Check if port is open
+    # Check if port is open
     - echo "Step 2// Checking port..."
     - nc -zv ${DOMAIN} 5000 || echo "Port check failed"
-    # Test 3: HTTP request with verbose output
+    # HTTP request with verbose output
     - echo "Step 3// HTTP request..."
     - |
       RESPONSE=$(curl -s --fail --connect-timeout 30 --max-time 60 "http://${DOMAIN}:5000" || echo "CURL_FAILED")
@@ -46,7 +47,7 @@ services:
 stages:
   - lint
   - build
-  # - security_scan
+  - security_scan
   - test
   - quality
   - package
@@ -96,8 +97,8 @@ build_image:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
     - echo "Building Docker image..."
-    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
-    - docker save -o app_image.tar $IMAGE_NAME:$IMAGE_TAG
+    - docker build -t $IMAGE_NAME:$DEFAULT_IMAGE_TAG .
+    - docker save -o app_image.tar $IMAGE_NAME:$DEFAULT_IMAGE_TAG
   artifacts:
     paths:
       - app_image.tar
@@ -119,8 +120,8 @@ build_image:
 #     - docker load -i app_image.tar
 #   script:
 #     - echo "Running Trivy security scan..."
-#     - trivy image --exit-code 0 --severity LOW,MEDIUM $IMAGE_NAME:$IMAGE_TAG
-#     - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME:$IMAGE_TAG
+#     - trivy image --exit-code 0 --severity LOW,MEDIUM $IMAGE_NAME:$DEFAULT_IMAGE_TAG
+#     - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME:$DEFAULT_IMAGE_TAG
 #   dependencies:
 #     - build_image
 #   allow_failure: true
@@ -161,7 +162,7 @@ integration_tests:
     - docker load -i app_image.tar
   script:
     - echo "Running integration tests..."
-    - docker run -d --name test_app --env PORT=5000 -p 5000:5000 $IMAGE_NAME:$IMAGE_TAG
+    - docker run -d --name test_app --env PORT=${APP_CONTAINER_PORT} -p 5000:${APP_CONTAINER_PORT} $IMAGE_NAME:$DEFAULT_IMAGE_TAG
     - sleep 10
     - docker ps
     - apk add --no-cache curl
@@ -216,10 +217,10 @@ push_to_registry:
     # Tag as v1.0.0 if on main branch
     - |
       if [ "$CI_COMMIT_REF_NAME" == "main" ]; then
-        docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:v1.0.0
-        docker push $IMAGE_NAME:v1.0.0
-      else
+        docker tag $IMAGE_NAME:$DEFAULT_IMAGE_TAG $IMAGE_NAME:$IMAGE_TAG
         docker push $IMAGE_NAME:$IMAGE_TAG
+      else
+        docker push $IMAGE_NAME:$DEFAULT_IMAGE_TAG
       fi
   dependencies:
     - build_image
@@ -384,9 +385,9 @@ deploy_review:
       HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
       ssh -o StrictHostKeyChecking=no ${SSH_USER}@${HOSTNAME_DEPLOY_REVIEW} "
         docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
-        docker pull ${IMAGE_NAME}:$CI_COMMIT_REF_SLUG &&
+        docker pull ${IMAGE_NAME}:$DEFAULT_IMAGE_TAG &&
         docker rm -f webapp || true &&
-        docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp ${IMAGE_NAME}:$CI_COMMIT_REF_SLUG
+        docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp ${IMAGE_NAME}:$DEFAULT_IMAGE_TAG
       "
     - |
       echo "Verifying deployment..."
@@ -462,24 +463,20 @@ deploy_in_staging:
   script:
     - apk add openssh-client
     - eval $(ssh-agent -s)
-    - mkdir -p ~/.ssh
-    - chmod -R 400 ~/.ssh
-    - touch ~/.ssh/known_hosts
-    - cd ~/.ssh
-    - echo "${SSH_KEY}" > id_rsa
-    - chmod 0400 id_rsa
-    - ssh-keyscan -t rsa  ${HOSTNAME_DEPLOY_STAGING} >> ~/.ssh/known_hosts
-    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
-    - command2="docker pull $IMAGE_NAME:v1.0.0"
-    - command3="docker rm -f webapp"
-    - command4="docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp $IMAGE_NAME:v1.0.0"
-    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY_STAGING} 
-      -o SendEnv=IMAGE_NAME 
-      -o SendEnv=CI_COMMIT_REF_SLUG 
-      -o SendEnv=CI_REGISTRY_USER 
-      -o SendEnv=CI_REGISTRY_PASSWORD 
-      -o SendEnv=CI_REGISTRY 
-      -C "$command1 && $command2 && $command3 && $command4"
+    - |
+      # Setup SSH
+      mkdir -p ~/.ssh
+      chmod 700 ~/.ssh
+      echo "${SSH_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+      chmod 600 ~/.ssh/id_rsa
+      ssh-keyscan -t rsa ${HOSTNAME_DEPLOY_STAGING} >> ~/.ssh/known_hosts 2>/dev/null
+    - |
+      ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${SSH_USER}@${HOSTNAME_DEPLOY_STAGING} "
+      docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY} &&
+      docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
+      docker rm -f webapp || true &&
+      docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp ${IMAGE_NAME}:${IMAGE_TAG}
+      "
   dependencies:
     - push_to_registry
 
@@ -495,24 +492,20 @@ deploy_in_prod:
   script:
     - apk add openssh-client
     - eval $(ssh-agent -s)
-    - mkdir -p ~/.ssh
-    - chmod -R 400 ~/.ssh
-    - touch ~/.ssh/known_hosts
-    - cd ~/.ssh
-    - echo "${SSH_KEY}" > id_rsa
-    - chmod 0400 id_rsa
-    - ssh-keyscan -t rsa  ${HOSTNAME_DEPLOY_PROD} >> ~/.ssh/known_hosts
-    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
-    - command2="docker pull $IMAGE_NAME:v1.0.0"
-    - command3="docker rm -f webapp"
-    - command4="docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp $IMAGE_NAME:v1.0.0"
-    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY_PROD} 
-      -o SendEnv=IMAGE_NAME 
-      -o SendEnv=CI_COMMIT_REF_SLUG 
-      -o SendEnv=CI_REGISTRY_USER 
-      -o SendEnv=CI_REGISTRY_PASSWORD 
-      -o SendEnv=CI_REGISTRY 
-      -C "$command1 && $command2 && $command3 && $command4"
+    - |
+      # Setup SSH
+      mkdir -p ~/.ssh
+      chmod 700 ~/.ssh
+      echo "${SSH_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+      chmod 600 ~/.ssh/id_rsa
+      ssh-keyscan -t rsa ${HOSTNAME_DEPLOY_PROD} >> ~/.ssh/known_hosts 2>/dev/null
+    - |
+      ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${SSH_USER}@${HOSTNAME_DEPLOY_PROD} "
+      docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY} &&
+      docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
+      docker rm -f webapp || true &&
+      docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp ${IMAGE_NAME}:${IMAGE_TAG}
+      "
   dependencies:
     - push_to_registry
 

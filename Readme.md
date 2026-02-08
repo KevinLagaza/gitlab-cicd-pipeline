@@ -99,8 +99,23 @@ Then, we can create a merge request to add the deployment in review environment.
 
 After successful deployment, we will delete the instance.
 
-**![Deployment in Review env](./images/manual_exec.png)**
+**![Manual deletion of Review env](./images/manual_exec.png)**
 
-**![Container Registry](./images/delete_instance.png)**
+**![Deleting Instance](./images/delete_instance.png)**
 
-**![Container Registry](./images/delete_instance_aws.png)**
+**![Deleting Instance in AWS](./images/delete_instance_aws.png)**
+
+
+## **Stage 8: Deployment in Staging and Production**
+
+Now, it is time to deploy the app in **staging** (pre-production) and **production**. 
+
+**![Final Deployment](./images/deployment.png)**
+
+## **Stage 9: Validation tests in Staging and Production**
+
+**![Validation Tests](./images/validation_test.png)**
+
+**![Validation Test in Staging](./images/test_staging.png)**
+
+**![Validation Tests in Prod](./images/test_prod.png)**
