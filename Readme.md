@@ -90,3 +90,17 @@ The first thing is to create a new branch from the main branch. Then, comment al
 **![Pushing to new branch](./images/push_to_new_branch.png)**
 
 Then, we can create a merge request to add the deployment in review environment.
+
+**![Deployment in Review env](./images/review_deployment.png)**
+
+**![Container Registry](./images/review_instance.png)**
+
+**![Container Registry](./images/inside_review_env.png)**
+
+After successful deployment, we will delete the instance.
+
+**![Deployment in Review env](./images/manual_exec.png)**
+
+**![Container Registry](./images/delete_instance.png)**
+
+**![Container Registry](./images/delete_instance_aws.png)**

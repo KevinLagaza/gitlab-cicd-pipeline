@@ -1,0 +1,537 @@
+variables:
+  AMI_ID: "ami-0866a3c8686eaeeba"
+  KEY_NAME: "deploy_app"
+  SECURITY_GROUP: "sg-05a234b3e6972aed4"
+  INSTANCE_TYPE: "t3.micro"
+  STORAGE: 100
+  APP_CONTAINER_PORT: "5000"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_TAG: $CI_COMMIT_REF_SLUG
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
+  GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
+
+
+image: docker:29
+services:
+  - name: docker:dind
+    alias: docker
+
+
+.test_template: &test
+  image: alpine
+  only:
+    - main
+  script:
+    - apk --no-cache add curl
+    - echo "Testing URL http://${DOMAIN}:5000"
+    # Test 1: Check if host is reachable
+    - echo "Step 1// Checking host connectivity..."
+    - ping -c 2 ${DOMAIN} || echo "Ping failed (might be blocked)"
+    # Test 2: Check if port is open
+    - echo "Step 2// Checking port..."
+    - nc -zv ${DOMAIN} 5000 || echo "Port check failed"
+    # Test 3: HTTP request with verbose output
+    - echo "Step 3// HTTP request..."
+    - |
+      RESPONSE=$(curl -s --fail --connect-timeout 30 --max-time 60 "http://${DOMAIN}:5000" || echo "CURL_FAILED")
+      echo "Response: ${RESPONSE}"
+      if echo "${RESPONSE}" | grep -q "Hello world!"; then
+        echo "✅ TEST PASSED!"
+      else
+        echo "❌ TEST FAILED!"
+        exit 1
+      fi
+
+
+stages:
+  - lint
+  - build
+  # - security_scan
+  - test
+  - quality
+  - package
+  - deploy_review
+  - stop_review
+  - deploy_staging
+  - deploy_prod
+  - test_staging
+  - test_prod
+
+
+# ==================== STAGE 1: LINT ====================
+
+flake8_lint:
+  stage: lint
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  image: python:3.11-alpine
+  before_script:
+    - pip install flake8
+  script:
+    - echo "Running flake8 linter..."
+    - flake8 --ignore=E501,E303 webapp/
+  allow_failure: false
+
+hadolint:
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  stage: lint
+  image: hadolint/hadolint:v2.14.0-alpine
+  script:
+    - echo "Running Hadolint on Dockerfile..."
+    - hadolint Dockerfile
+  allow_failure: true
+
+
+# ==================== STAGE 2: BUILD ====================
+
+build_image:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Building Docker image..."
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - docker save -o app_image.tar $IMAGE_NAME:$IMAGE_TAG
+  artifacts:
+    paths:
+      - app_image.tar
+    expire_in: 1 hour
+  dependencies:
+    - flake8_lint
+    - hadolint
+
+# ==================== STAGE 3: SECURITY SCAN ====================
+
+# trivy_scan:
+#   stage: security_scan
+# rules:
+#     - if: $CI_COMMIT_BRANCH
+#     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+#   before_script:
+#     - apk add --no-cache curl
+#     - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.69.0
+#     - docker load -i app_image.tar
+#   script:
+#     - echo "Running Trivy security scan..."
+#     - trivy image --exit-code 0 --severity LOW,MEDIUM $IMAGE_NAME:$IMAGE_TAG
+#     - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME:$IMAGE_TAG
+#   dependencies:
+#     - build_image
+#   allow_failure: true
+#   dependencies:
+#     - build_image
+
+# ==================== STAGE 4: TESTS ====================
+
+unit_tests:
+  stage: test
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  image: python:3.11-alpine
+  before_script:
+    - pip install -r webapp/requirements.txt
+    - pip install pytest pytest-cov
+  script:
+    - echo "Running unit tests..."
+    - cd webapp
+    - python -m pytest tests.py -v --cov=. --cov-report=xml:coverage.xml --cov-report=term
+  artifacts:
+    paths:
+      - webapp/coverage.xml
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: webapp/coverage.xml
+    expire_in: 1 week
+  coverage: '/TOTAL.*\s+(\d+%)/'
+
+integration_tests:
+  stage: test
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - docker load -i app_image.tar
+  script:
+    - echo "Running integration tests..."
+    - docker run -d --name test_app --env PORT=5000 -p 5000:5000 $IMAGE_NAME:$IMAGE_TAG
+    - sleep 10
+    - docker ps
+    - apk add --no-cache curl
+    - |
+      RESPONSE=$(curl http://docker:5000)
+      echo $RESPONSE
+      if echo "$RESPONSE" | grep -q "Hello world!"; then
+        echo "Integration test passed!"
+      else
+        echo "Integration test failed!"
+        exit 1
+      fi
+  after_script:
+    - docker stop test_app
+    - docker rm test_app
+  dependencies:
+    - build_image
+
+# ==================== STAGE 5: QUALITY ====================
+
+sonarcloud_analysis:
+  stage: quality
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  image:
+    name: sonarsource/sonar-scanner-cli:12.0
+    entrypoint: [""]
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - ${SONAR_USER_HOME} 
+  script:
+    - echo "Running SonarCloud analysis..."
+    - sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.organization=$SONAR_ORGANIZATION -Dsonar.sources=webapp -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.token=$SONAR_TOKEN -Dsonar.verbose=true -Dsonar.python.coverage.reportPaths=webapp/coverage.xml
+  dependencies:
+    - unit_tests
+  allow_failure: true
+
+# ==================== STAGE 6: PACKAGE ====================
+
+push_to_registry:
+  stage: package
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker load -i app_image.tar
+  script:
+    - echo "Pushing image to GitLab Registry..."
+    # Tag as v1.0.0 if on main branch
+    - |
+      if [ "$CI_COMMIT_REF_NAME" == "main" ]; then
+        docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:v1.0.0
+        docker push $IMAGE_NAME:v1.0.0
+      else
+        docker push $IMAGE_NAME:$IMAGE_TAG
+      fi
+  dependencies:
+    - build_image
+    - unit_tests
+    - integration_tests
+
+# ==================== STAGE 7: DEPLOYMENT IN REVIEW ====================
+
+deploy_review:
+  stage: deploy_review
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: ${REVIEW_ENVIRONMENT_URL}
+    on_stop: stop_review
+  script:
+    # ========== INITIAL SETUP ==========
+    - export INIT_PATH=$(pwd)
+    - apk add --no-cache python3 py3-pip
+    - python3 -m venv venv  # Create a virtual environment 
+    - source venv/bin/activate  # Activate the virtual environment
+    - pip install awscli  # Install awscli in the virtual environment
+
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set region $AWS_DEFAULT_REGION
+
+    - export BRANCH_NAME=$CI_COMMIT_REF_SLUG
+    - echo ${BRANCH_NAME}
+    - export TAG="review-${BRANCH_NAME}"
+    - echo ${TAG}
+    # ========== CREATING THE EC2 INSTANCE ==========
+    - |
+      INSTANCE_ID=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${TAG}" \
+        --query "Reservations[*].Instances[*].InstanceId" \
+        --output text)
+
+      if [ -n "${INSTANCE_ID}" ]; then
+        echo "Instance with tag '${TAG}' already exists: ${INSTANCE_ID}"
+      else
+        echo "Creating new EC2 instance..."
+        
+        aws ec2 run-instances \
+          --image-id ${AMI_ID} \
+          --count 1 \
+          --instance-type ${INSTANCE_TYPE} \
+          --key-name ${KEY_NAME} \
+          --security-group-ids ${SECURITY_GROUP} \
+          --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=${STORAGE}} \
+          --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${TAG}}]" \
+          --user-data """#!/bin/bash
+      exec > /var/log/user-data.log 2>&1
+      set -x
+      apt-get update -y
+      curl -fsSL https://get.docker.com -o install-docker.sh
+      sh install-docker.sh
+      systemctl enable docker
+      systemctl start docker
+      usermod -aG docker ubuntu"""
+
+        echo "Waiting for instance to initialize..."
+        sleep 240
+        echo "EC2 instance created with tag '${TAG}'."
+      fi
+    
+    # Wait for instance to be in running state
+    - |
+      echo "Waiting for instance to be running..."
+      aws ec2 wait instance-running \
+        --filters "Name=tag:Name,Values=${TAG}"
+      echo "Instance is now running!"
+
+    - |
+      PUBLIC_IP=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${TAG}" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].PublicIpAddress" \
+        --output text)
+
+      if [ -z "${PUBLIC_IP}" ]; then
+        echo "No instance found with tag '${TAG}'."
+        exit 1
+      fi
+      # Persisting the IP to ensure its availability afterwards
+      echo "Public IP is ${PUBLIC_IP}"
+      echo "${PUBLIC_IP}" > /tmp/host_ip.txt
+      cat /tmp/host_ip.txt
+
+    # ========== SSH SETUP ==========
+    - apk add openssh-client
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    
+    # Write the SSH key with the right format
+    - echo "${SSH_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    
+    # Verify the key format 
+    - echo "SSH key first line:"
+    - head -1 ~/.ssh/id_rsa
+    - echo "SSH key last line:"
+    - tail -1 ~/.ssh/id_rsa
+    
+    # Verify the permissions
+    - ls -la ~/.ssh/
+    
+    # Add the host to known_hosts
+    - |
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      for i in $(seq 1 10); do
+        if ssh-keyscan -t rsa ${HOSTNAME_DEPLOY_REVIEW} >> ~/.ssh/known_hosts 2>/dev/null; then
+          echo "Host added to known_hosts"
+          break
+        fi
+        echo "Waiting for SSH port to be available... attempt $i/10"
+        sleep 10
+      done
+
+    # Test SSH connection
+    - |
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      echo "Testing SSH connection to ${HOSTNAME_DEPLOY_REVIEW}..."
+      SSH_OK=false
+      for i in $(seq 1 15); do
+        echo "SSH attempt $i/15..."
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_rsa ${SSH_USER}@${HOSTNAME_DEPLOY_REVIEW} "echo 'SSH connection successful!'"; then
+          echo "SSH connection established!"
+          SSH_OK=true
+          break
+        fi
+        echo "SSH not ready, waiting..."
+        sleep 15
+      done
+      
+      if [ "${SSH_OK}" != "true" ]; then
+        echo "ERROR: Could not establish SSH connection"
+        exit 1
+      fi
+    # Wait for Docker
+    - |
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      echo "Waiting for Docker to be ready on ${HOSTNAME_DEPLOY_REVIEW}..."
+      DOCKER_OK=false
+      for i in $(seq 1 30); do
+        if ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${SSH_USER}@${HOSTNAME_DEPLOY_REVIEW} "docker --version" 2>/dev/null; then
+          echo "Docker is ready!"
+          DOCKER_OK=true
+          break
+        fi
+        echo "Docker not ready, waiting... attempt $i/30"
+        sleep 10
+      done
+      
+      if [ "${DOCKER_OK}" != "true" ]; then
+        echo "ERROR: Docker is not ready"
+        exit 1
+      fi
+    # ========== DEPLOYMENT SETUP ==========
+    - |
+      echo "Deploying application..."
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      ssh -o StrictHostKeyChecking=no ${SSH_USER}@${HOSTNAME_DEPLOY_REVIEW} "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        docker pull ${IMAGE_NAME}:$CI_COMMIT_REF_SLUG &&
+        docker rm -f webapp || true &&
+        docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp ${IMAGE_NAME}:$CI_COMMIT_REF_SLUG
+      "
+    - |
+      echo "Verifying deployment..."
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${SSH_USER}@${HOSTNAME_DEPLOY_REVIEW} "docker ps | grep webapp"
+      
+    - |
+      echo "Creating the artifact"
+      cd ${INIT_PATH}
+      HOSTNAME_DEPLOY_REVIEW=$(cat /tmp/host_ip.txt)
+      echo "REVIEW_ENVIRONMENT_URL=http://${HOSTNAME_DEPLOY_REVIEW}" >> deploy.env
+      echo "Deployment completed!"
+
+  artifacts:
+    reports:
+      dotenv: deploy.env 
+  dependencies:
+    - push_to_registry
+
+
+stop_review:
+  stage: stop_review
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  when: manual
+  script:
+    - apk add --no-cache python3 py3-pip
+    - python3 -m venv venv  # Create a virtual environment 
+    - source venv/bin/activate  # Activate the virtual environment
+    - pip install awscli  # Install awscli in the virtual environment
+
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set region $AWS_DEFAULT_REGION
+
+    - export BRANCH_NAME=$CI_COMMIT_REF_SLUG
+    - export TAG="review-${BRANCH_NAME}"
+    - export NEW_TAG="destroyed-${BRANCH_NAME}"
+
+    - |
+      INSTANCE_ID=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${TAG}" \
+        --query "Reservations[*].Instances[*].InstanceId" \
+        --output text)
+
+    - |
+      if [ -n "${INSTANCE_ID}" ]; then
+        echo "Suppression de l'instance avec le tag '${TAG}': ${INSTANCE_ID}"
+
+        # Mettre à jour le tag de l'instance
+        aws ec2 create-tags --resources ${INSTANCE_ID} --tags Key=Name,Value=${NEW_TAG}
+        echo "Tag de l'instance mis à jour en '${NEW_TAG}'."
+
+        echo "Suppression de l'instance avec le tag '${NEW_TAG}': ${INSTANCE_ID}"
+        aws ec2 terminate-instances --instance-ids ${INSTANCE_ID}
+        echo "Instance EC2 supprimée avec le tag '${NEW_TAG}'."
+      else
+        echo "Aucune instance avec le tag '${TAG}' à supprimer."
+      fi
+
+# ==================== STAGE 8: DEPLOYMENT IN STAGING ====================
+
+deploy_in_staging: 
+  stage: deploy_staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  environment:
+    name: staging
+    url: http://${HOSTNAME_DEPLOY_STAGING}
+  script:
+    - apk add openssh-client
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod -R 400 ~/.ssh
+    - touch ~/.ssh/known_hosts
+    - cd ~/.ssh
+    - echo "${SSH_KEY}" > id_rsa
+    - chmod 0400 id_rsa
+    - ssh-keyscan -t rsa  ${HOSTNAME_DEPLOY_STAGING} >> ~/.ssh/known_hosts
+    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - command2="docker pull $IMAGE_NAME:v1.0.0"
+    - command3="docker rm -f webapp"
+    - command4="docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp $IMAGE_NAME:v1.0.0"
+    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY_STAGING} 
+      -o SendEnv=IMAGE_NAME 
+      -o SendEnv=CI_COMMIT_REF_SLUG 
+      -o SendEnv=CI_REGISTRY_USER 
+      -o SendEnv=CI_REGISTRY_PASSWORD 
+      -o SendEnv=CI_REGISTRY 
+      -C "$command1 && $command2 && $command3 && $command4"
+  dependencies:
+    - push_to_registry
+
+# ==================== STAGE 9: DEPLOYMENT IN PRODUCTION ====================
+
+deploy_in_prod: 
+  stage: deploy_prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  environment:
+    name: prod
+    url: http://${HOSTNAME_DEPLOY_PROD}
+  script:
+    - apk add openssh-client
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod -R 400 ~/.ssh
+    - touch ~/.ssh/known_hosts
+    - cd ~/.ssh
+    - echo "${SSH_KEY}" > id_rsa
+    - chmod 0400 id_rsa
+    - ssh-keyscan -t rsa  ${HOSTNAME_DEPLOY_PROD} >> ~/.ssh/known_hosts
+    - command1="docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - command2="docker pull $IMAGE_NAME:v1.0.0"
+    - command3="docker rm -f webapp"
+    - command4="docker run -d -p 5000:${APP_CONTAINER_PORT} --env PORT=${APP_CONTAINER_PORT} --name webapp $IMAGE_NAME:v1.0.0"
+    - ssh -t ${SSH_USER}@${HOSTNAME_DEPLOY_PROD} 
+      -o SendEnv=IMAGE_NAME 
+      -o SendEnv=CI_COMMIT_REF_SLUG 
+      -o SendEnv=CI_REGISTRY_USER 
+      -o SendEnv=CI_REGISTRY_PASSWORD 
+      -o SendEnv=CI_REGISTRY 
+      -C "$command1 && $command2 && $command3 && $command4"
+  dependencies:
+    - push_to_registry
+
+
+# ==================== STAGE 10: VALIDATION TESTS ====================
+
+test_app_staging:
+  <<: *test
+  stage: test_staging
+  variables:
+    DOMAIN: ${HOSTNAME_DEPLOY_STAGING}
+  dependencies:
+    - deploy_in_staging
+
+
+test_app_prod:
+  <<: *test
+  stage: test_prod
+  variables:
+    DOMAIN: ${HOSTNAME_DEPLOY_PROD}
+  dependencies:
+    - deploy_in_prod
