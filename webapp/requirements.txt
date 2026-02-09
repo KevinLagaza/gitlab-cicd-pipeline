@@ -4,3 +4,4 @@ Jinja2
 Werkzeug
 pytest
 pytest-cov
+Flask-WTF
