@@ -56,6 +56,8 @@ The goal is to build a docker image as an artefact. **This stage will always be 
 
 ## **Stage 3: Security Scan** 
 
+**![Security Scan](./images/secu_scan.png)**
+
 **This stage will always be trigered after a push on any branch**.
 
 ## **Stage 4: Tests** 
