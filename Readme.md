@@ -1,4 +1,4 @@
-# COMPLETE GITLAB CICD PROJECT 
+# GITLAB CI_CD PROJECT 
 
 ## **Context**
 
